@@ -190,13 +190,11 @@ or when you ask.
 
 ## Tests
 
-`agent-shell` itself is not loaded — the tests run against a fake ACP client —
-but `agent-shell-ui` is, so its dependencies have to be reachable.
+`agent-shell` is not loaded — the tests run against a fake ACP client — so
+only `acp` has to be reachable.
 
 ```sh
-emacs --batch -L . -L tests -L /path/to/agent-shell \
-      -L ~/.emacs.d/elpa/acp-* -L ~/.emacs.d/elpa/shell-maker-* \
-      -L ~/.emacs.d/elpa/compat-* \
+emacs --batch -L . -L tests -L ~/.emacs.d/elpa/acp-* \
       -l tests/agent-shell-autoreconnect-tests.el \
       -f ert-run-tests-batch-and-exit
 ```
