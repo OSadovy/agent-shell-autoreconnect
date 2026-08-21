@@ -207,6 +207,30 @@ announced a reconnection that had not happened."
         (agent-shell-autoreconnect--submit (lambda (&rest _args) :sent))
         (should-not seen))))))
 
+(ert-deftest agent-shell-autoreconnect-says-nothing-when-the-buffer-is-closing-test ()
+  "Test killing a shell is not announced as a lost connection.
+
+Closing a shell ends its agent, and the process dies while the buffer is
+still live -- agent-shell tears the client down from `kill-buffer-hook'.
+Read as a disconnection, that made every closed shell announce one."
+  (let ((process (start-process "agent-shell-autoreconnect-test" nil "sleep" "60")))
+    (unwind-protect
+        (with-temp-buffer
+          (agent-shell-autoreconnect-tests--shell (list (cons :process process)))
+          (setq agent-shell-autoreconnect--state 'connected)
+          (agent-shell-autoreconnect--watch-process process)
+          (let (seen)
+            (let ((agent-shell-autoreconnect-state-functions
+                   (list (lambda (event) (push (map-elt event :state) seen)))))
+              ;; What agent-shell's `clean-up' event sets, just before it
+              ;; shuts the client down.
+              (setq agent-shell-autoreconnect--closing t)
+              (delete-process process)
+              (accept-process-output nil 0.3)
+              (should-not seen)
+              (should (eq 'connected agent-shell-autoreconnect--state)))))
+      (when (process-live-p process) (delete-process process)))))
+
 (provide 'agent-shell-autoreconnect-tests)
 
 ;;; agent-shell-autoreconnect-tests.el ends here

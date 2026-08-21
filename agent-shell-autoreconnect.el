@@ -127,6 +127,16 @@ indistinguishable from having nothing to send.")
 (defvar-local agent-shell-autoreconnect--subscription nil
   "Token for this shell's `init-finished' subscription, while one is live.")
 
+(defvar-local agent-shell-autoreconnect--closing nil
+  "Non-nil once this shell is being torn down.
+
+A buffer being killed loses its agent on the way out, and that is not a
+disconnection worth reporting -- there is nothing left to reconnect and
+nobody to tell.")
+
+(defvar-local agent-shell-autoreconnect--cleanup-subscription nil
+  "Token for this shell's `clean-up' subscription.")
+
 (defvar-local agent-shell-autoreconnect--error-subscription nil
   "Token for this shell's `error' subscription.
 
@@ -183,7 +193,8 @@ failure that has not happened."
 Collapsing to the reported state rather than the transitions means a
 connection that fails and retries several times is announced once, and a
 state this package gains later cannot introduce new noise."
-  (unless (eq state agent-shell-autoreconnect--state)
+  (unless (or agent-shell-autoreconnect--closing
+              (eq state agent-shell-autoreconnect--state))
     ;; Written before the handlers run, so a handler that looks at other
     ;; shells sees this one already counted, and a re-entrant call stops.
     (setq agent-shell-autoreconnect--state state)
@@ -565,11 +576,13 @@ and \\[keyboard-quit] works, never while you are reading something else."
 (defun agent-shell-autoreconnect--teardown ()
   "Release this shell's subscription and any held submission."
   (agent-shell-autoreconnect--unsubscribe)
-  (when agent-shell-autoreconnect--error-subscription
-    (ignore-errors
-      (agent-shell-unsubscribe
-       :subscription agent-shell-autoreconnect--error-subscription))
-    (setq agent-shell-autoreconnect--error-subscription nil))
+  (setq agent-shell-autoreconnect--closing t)
+  (dolist (slot '(agent-shell-autoreconnect--error-subscription
+                  agent-shell-autoreconnect--cleanup-subscription))
+    (when (symbol-value slot)
+      (ignore-errors
+        (agent-shell-unsubscribe :subscription (symbol-value slot)))
+      (set slot nil)))
   (setq agent-shell-autoreconnect--deferred nil)
   (remove-hook 'kill-buffer-hook #'agent-shell-autoreconnect--teardown t)
   (remove-hook 'change-major-mode-hook #'agent-shell-autoreconnect--teardown t))
@@ -609,6 +622,15 @@ contacting anything."
            :shell-buffer (current-buffer)
            :event 'error
            :on-event #'agent-shell-autoreconnect--on-error))
+    ;; `clean-up' is emitted just before agent-shell shuts the client down for
+    ;; a buffer being killed.  Without it the process dies while the buffer is
+    ;; still live, and the sentinel calls that a disconnection.
+    (setq agent-shell-autoreconnect--cleanup-subscription
+          (agent-shell-subscribe-to
+           :shell-buffer (current-buffer)
+           :event 'clean-up
+           :on-event (lambda (_event)
+                       (setq agent-shell-autoreconnect--closing t))))
     (add-hook 'kill-buffer-hook #'agent-shell-autoreconnect--teardown nil t)
     (add-hook 'change-major-mode-hook #'agent-shell-autoreconnect--teardown nil t))
    (t
