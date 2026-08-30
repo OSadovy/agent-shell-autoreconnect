@@ -134,6 +134,14 @@ A buffer being killed loses its agent on the way out, and that is not a
 disconnection worth reporting -- there is nothing left to reconnect and
 nobody to tell.")
 
+(defvar-local agent-shell-autoreconnect--had-process nil
+  "Whether this shell has ever had an agent process.
+
+No process reads the same whether one is yet to start or has been and
+gone, and `agent-shell-autoreconnect-connected-p' must answer those
+oppositely.  Tracked on the process, not the client: `acp-make-client'
+leaves `:process' nil until the first request.")
+
 (defvar-local agent-shell-autoreconnect--cleanup-subscription nil
   "Token for this shell's `clean-up' subscription.")
 
@@ -181,11 +189,18 @@ current when it rendered, which the replay's own namespace differs from.")
 (defun agent-shell-autoreconnect-connected-p (&optional buffer)
   "Return non-nil when BUFFER's shell has a live agent process.
 
-A shell that has not started one yet counts as connected: there is
-nothing to reconnect to, and reporting it as down would announce a
-failure that has not happened."
-  (let ((process (agent-shell-autoreconnect--process buffer)))
-    (or (null process) (process-live-p process) nil)))
+A shell that has never started one counts as connected: agent-shell
+starts it lazily, and reporting a failure that has not happened is noise.
+A shell whose process is gone reads the same and means the opposite, so
+the two are told apart by `agent-shell-autoreconnect--had-process'.  A
+failed reconnect leaves that, and calling it connected means submitting
+into a fresh agent that was never told this buffer's session."
+  (let* ((buffer (or buffer (current-buffer)))
+         (process (agent-shell-autoreconnect--process buffer)))
+    (cond ((process-live-p process) t)
+          (process nil)
+          (t (not (buffer-local-value 'agent-shell-autoreconnect--had-process
+                                      buffer))))))
 
 (defun agent-shell-autoreconnect--report (state)
   "Report STATE for the current shell, when it is not already what was said.
@@ -240,15 +255,22 @@ not read as this one having been forgotten."
          (string-match-p "not found" message))))
 
 (defun agent-shell-autoreconnect--on-error (event)
-  "Report the session gone when EVENT says the agent has forgotten it.
+  "Act on EVENT: a reconnect that failed, or a session the agent has forgotten.
 
-This arrives as a failed request rather than a dead process, which is why
-the sentinel cannot see it: the connection is in perfect health and it is
-the session behind it that stopped existing.  Left unreported, the shell
-goes on claiming to be connected -- true, and useless."
-  (when (agent-shell-autoreconnect--session-gone-p
-         (map-nested-elt event '(:data :message)))
-    (agent-shell-autoreconnect--report 'session-gone)))
+A forgotten session arrives as a failed request, not a dead process: the
+connection is healthy and only the session behind it is gone, so the
+sentinel cannot see it.
+
+While reconnecting, any error is that reconnect failing -- the handshake
+is all that is in flight.  This is its only signal, because the
+`condition-case' in `agent-shell-autoreconnect--reconnect' has long
+returned and the sentinel watches the process being replaced.  Unhandled,
+the shell waits forever for an `init-finished' that is not coming."
+  (let ((message (map-nested-elt event '(:data :message))))
+    (cond ((eq agent-shell-autoreconnect--state 'reconnecting)
+           (agent-shell-autoreconnect--fail-reconnect message))
+          ((agent-shell-autoreconnect--session-gone-p message)
+           (agent-shell-autoreconnect--report 'session-gone)))))
 
 (defun agent-shell-autoreconnect--watch-client ()
   "Watch this shell's ACP client, for both the ids and the moment it dies.
@@ -283,6 +305,7 @@ A host that vanishes without closing the connection -- a closed lid, a
 tunnel -- is noticed when ssh's keepalives give up rather than at once.
 Later than the truth, but still by itself."
   (when (processp process)
+    (setq agent-shell-autoreconnect--had-process t)
     (let ((buffer (current-buffer)))
       (add-function
        :after (process-sentinel process)
@@ -498,6 +521,43 @@ subscribed to this shell."
   (setq-local agent-shell-session-restore-verbosity 'minimal)
   (agent-shell--handle :shell-buffer (current-buffer)))
 
+(defun agent-shell-autoreconnect--roll-back ()
+  "Undo the teardown of a reconnect that never rebuilt the connection.
+
+`agent-shell-autoreconnect--reconnect-in-place' clears the session id
+before starting the replacement, and `agent-shell-submit' refuses without
+one -- before `shell-maker-submit', where the retrying advice lives.  So a
+failure part way through leaves a shell that cannot reconnect at all.
+
+Keyed on the missing session id, which only the teardown clears: a
+reconnect refused before it started still has one, and its
+`:resume-session-id' may name an older session."
+  (let ((state (agent-shell--state)))
+    (unless (map-nested-elt state '(:session :id))
+      (map-put! (map-elt state :session) :id
+                (map-elt state :resume-session-id))
+      ;; The handshake is recorded as in flight and only its callbacks
+      ;; remove it -- neither runs when the process never came up.
+      (map-put! state :active-requests nil))))
+
+(defun agent-shell-autoreconnect--fail-reconnect (&optional message)
+  "Give up on the reconnect in progress, reporting what MESSAGE says of it.
+
+Restores what the attempt tore down and stops waiting on it; anything left
+behind makes one failed reconnect permanent.  The held submission is
+dropped -- `agent-shell-autoreconnect--submit' never passed it on, so the
+text is still in the input area.
+
+Rolled back before MESSAGE is judged: recognising a forgotten session
+needs the session id the roll-back restores."
+  (agent-shell-autoreconnect--roll-back)
+  (agent-shell-autoreconnect--unsubscribe)
+  (setq agent-shell-autoreconnect--deferred nil)
+  (agent-shell-autoreconnect--report
+   (if (agent-shell-autoreconnect--session-gone-p message)
+       'session-gone
+     'disconnected)))
+
 (defun agent-shell-autoreconnect--reconnect (&optional deferred)
   "Reconnect this shell, sending DEFERRED once it is up again.
 
@@ -513,10 +573,11 @@ describes, or nil to reconnect without sending anything."
          :on-event #'agent-shell-autoreconnect--on-initialized))
   (condition-case error
       (agent-shell-autoreconnect--reconnect-in-place)
-    (error
-     (agent-shell-autoreconnect--unsubscribe)
-     (setq agent-shell-autoreconnect--deferred nil)
-     (agent-shell-autoreconnect--report 'disconnected)
+    ;; `quit' as well as `error': C-g through a slow TRAMP connect is
+    ;; expected, not exceptional.  Uncaught, it leaves the shell reporting
+    ;; `reconnecting' with nothing reconnecting, refusing every submission.
+    ((error quit)
+     (agent-shell-autoreconnect--fail-reconnect)
      (signal (car error) (cdr error)))))
 
 ;;;###autoload

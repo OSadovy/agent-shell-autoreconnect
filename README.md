@@ -188,6 +188,12 @@ takes. On a timer that freeze would arrive at a moment nothing explains.
 So it happens only where a pause makes sense and `C-g` works: when you submit,
 or when you ask.
 
+A reconnect that fails — an unreachable host, an agent that dies part-way
+through the handshake, or `C-g` through a connect taking too long — leaves the
+shell as it was rather than half torn down: still disconnected, still holding
+the session to resume, and still repairable by submitting again. Your typed
+text stays in the input area, so retrying is one more `RET`.
+
 ## Tests
 
 `agent-shell` is not loaded — the tests run against a fake ACP client — so

@@ -19,6 +19,9 @@
 (unless (fboundp 'agent-shell--state)
   (defun agent-shell--state () agent-shell--state))
 
+(unless (fboundp 'agent-shell--active-requests-p)
+  (defun agent-shell--active-requests-p (state) (map-elt state :active-requests)))
+
 (defun agent-shell-autoreconnect-tests--shell (client)
   "Make the current buffer look like a shell whose ACP state holds CLIENT."
   (setq major-mode 'agent-shell-mode)
@@ -26,12 +29,19 @@
   (setq-local agent-shell-autoreconnect-mode t))
 
 (ert-deftest agent-shell-autoreconnect-connected-p-test ()
-  "Test liveness is read from the ACP client's process."
+  "Test liveness is read from the ACP client's process, and from its absence.
+
+No process reads the same whether one is yet to start or has been and
+gone, and those are opposite answers."
   (with-temp-buffer
     ;; No process yet: bootstrapping has not reached one, so there is nothing
     ;; to reconnect and reporting a failure would invent one.
     (agent-shell-autoreconnect-tests--shell (list (cons :process nil)))
-    (should (agent-shell-autoreconnect-connected-p)))
+    (should (agent-shell-autoreconnect-connected-p))
+    ;; Had one, and it is gone -- a reconnect drops the client before
+    ;; building its replacement.
+    (setq agent-shell-autoreconnect--had-process t)
+    (should-not (agent-shell-autoreconnect-connected-p)))
   (let ((process (start-process "agent-shell-autoreconnect-test" nil "sleep" "60")))
     (unwind-protect
         (with-temp-buffer
@@ -230,6 +240,154 @@ Read as a disconnection, that made every closed shell announce one."
               (should-not seen)
               (should (eq 'connected agent-shell-autoreconnect--state)))))
       (when (process-live-p process) (delete-process process)))))
+
+(defun agent-shell-autoreconnect-tests--remote-shell (process)
+  "Make the current buffer look like a shell connected over PROCESS.
+
+Carries every key `agent-shell-autoreconnect--reconnect-in-place' writes,
+because `map-put!' on an alist cannot add one."
+  (setq major-mode 'agent-shell-mode)
+  (setq-local agent-shell--state
+              (list (cons :client (list (cons :process process)))
+                    (cons :initialized t)
+                    (cons :authenticated t)
+                    (cons :active-requests nil)
+                    (cons :resume-session-id nil)
+                    (cons :session (list (cons :id "session-1")))))
+  (setq-local agent-shell-autoreconnect-mode t)
+  (setq agent-shell-autoreconnect--had-process t))
+
+(defmacro agent-shell-autoreconnect-tests--with-failing-reconnect (signal &rest body)
+  "Run BODY with a reconnect whose replacement process fails with SIGNAL.
+
+Stubs only agent-shell, so the teardown and roll-back under test are real."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'agent-shell--shutdown) #'ignore)
+             ((symbol-function 'agent-shell-subscribe-to)
+              (lambda (&rest _) 'token))
+             ((symbol-function 'agent-shell-unsubscribe) #'ignore)
+             ((symbol-function 'agent-shell--handle)
+              (lambda (&rest _)
+                ;; Where a reconnect to an unreachable host dies: the
+                ;; handshake is already recorded as in flight.
+                (map-put! (agent-shell--state) :active-requests
+                          (list (list (cons :method "initialize"))))
+                ,signal)))
+     ,@body))
+
+(ert-deftest agent-shell-autoreconnect-rolls-back-a-quit-mid-reconnect-test ()
+  "Test quitting a slow reconnect is undone the same as a failure.
+
+A `quit' is not an `error', so catching only the latter lets it past the
+roll-back, leaving the shell stuck at `reconnecting'.  What the roll-back
+restores is covered where a failing reconnect is."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--remote-shell nil)
+    (agent-shell-autoreconnect-tests--with-failing-reconnect (signal 'quit nil)
+      ;; Not `should-error': it catches errors, and the point here is that a
+      ;; quit is not one.
+      (let ((quit nil))
+        (condition-case nil
+            (agent-shell-autoreconnect--reconnect)
+          (quit (setq quit t)))
+        (should quit)))
+    (should (eq 'disconnected agent-shell-autoreconnect--state))))
+
+(ert-deftest agent-shell-autoreconnect-leaves-a-failed-reconnect-repairable-test ()
+  "Test a reconnect that cannot reach the host can still be retried.
+
+One story, because either half alone leaves the shell stuck: without the
+session id `agent-shell-submit' refuses before reaching the advice that
+retries, and with it the submission must ask for another reconnect rather
+than start a fresh agent that was never told this buffer's session."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--remote-shell nil)
+    (agent-shell-autoreconnect-tests--with-failing-reconnect
+        (signal 'file-error (list "Tramp failed to connect"))
+      (should-error (agent-shell-autoreconnect--reconnect) :type 'file-error))
+    (should (equal "session-1" (map-nested-elt (agent-shell--state) '(:session :id))))
+    (should-not (map-elt (agent-shell--state) :active-requests))
+    (should (eq 'disconnected agent-shell-autoreconnect--state))
+    (let ((reconnects 0)
+          (sent 0))
+      (cl-letf (((symbol-function 'agent-shell-autoreconnect--reconnect)
+                 (lambda (&rest _) (setq reconnects (1+ reconnects)))))
+        (agent-shell-autoreconnect--submit (lambda (&rest _) (setq sent (1+ sent)))))
+      (should (equal 1 reconnects))
+      (should (zerop sent)))))
+
+(ert-deftest agent-shell-autoreconnect-keeps-a-live-session-on-a-refused-reconnect-test ()
+  "Test a reconnect refused before it starts does not adopt a stale session.
+
+It still has its own session id, and `:resume-session-id' may name an
+older one."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--remote-shell nil)
+    (map-put! (agent-shell--state) :resume-session-id "an-older-session")
+    (agent-shell-autoreconnect--roll-back)
+    (should (equal "session-1" (map-nested-elt (agent-shell--state) '(:session :id))))))
+
+(defun agent-shell-autoreconnect-tests--mid-reconnect ()
+  "Leave the current buffer as a reconnect that has torn down but not rebuilt.
+
+What `agent-shell-autoreconnect--reconnect-in-place' leaves once it has
+started the replacement: no client, no session id, the id to resume put
+aside, and the handshake in flight."
+  (agent-shell-autoreconnect-tests--remote-shell nil)
+  (map-put! (agent-shell--state) :client nil)
+  (map-put! (agent-shell--state) :resume-session-id "session-1")
+  (map-put! (agent-shell--state) :active-requests
+            (list (list (cons :method "initialize"))))
+  (map-put! (map-elt (agent-shell--state) :session) :id nil)
+  (setq agent-shell-autoreconnect--state 'reconnecting)
+  (setq agent-shell-autoreconnect--deferred (list nil))
+  (setq agent-shell-autoreconnect--subscription 'token))
+
+(ert-deftest agent-shell-autoreconnect-fails-a-reconnect-that-dies-handshaking-test ()
+  "Test a replacement process that starts and then dies ends the reconnect.
+
+The `condition-case' has returned by then and the sentinel watches the
+process being replaced, so acp's failed request is the only signal.
+Missed, the shell waits forever for an `init-finished'."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'agent-shell-unsubscribe) #'ignore))
+      (agent-shell-autoreconnect-tests--mid-reconnect)
+      (agent-shell-autoreconnect--on-error
+       '((:data (:message . "Agent process ended before completing request"))))
+      (should (eq 'disconnected agent-shell-autoreconnect--state))
+      (should (equal "session-1" (map-nested-elt (agent-shell--state) '(:session :id))))
+      (should-not (map-elt (agent-shell--state) :active-requests))
+      (should-not agent-shell-autoreconnect--deferred)
+      (should-not agent-shell-autoreconnect--subscription))))
+
+(ert-deftest agent-shell-autoreconnect-reports-a-session-the-resume-could-not-find-test ()
+  "Test a resume refused for a forgotten session says so, not `disconnected'.
+
+Reconnecting is not the repair.  Recognising it means comparing against
+the session id, which only exists again after the roll-back."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'agent-shell-unsubscribe) #'ignore))
+      (agent-shell-autoreconnect-tests--mid-reconnect)
+      (agent-shell-autoreconnect--on-error
+       '((:data (:message . "Session session-1 not found"))))
+      (should (eq 'session-gone agent-shell-autoreconnect--state)))))
+
+(ert-deftest agent-shell-autoreconnect-leaves-an-ordinary-error-alone-test ()
+  "Test an error on a working shell is not read as a failed reconnect.
+
+Only a reconnect in progress turns every error into one."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--remote-shell nil)
+    (setq agent-shell-autoreconnect--state 'connected)
+    (let (seen)
+      (let ((agent-shell-autoreconnect-state-functions
+             (list (lambda (event) (push (map-elt event :state) seen)))))
+        (agent-shell-autoreconnect--on-error
+         '((:data (:message . "Tool call failed"))))
+        (should-not seen)
+        (agent-shell-autoreconnect--on-error
+         '((:data (:message . "Session session-1 not found"))))
+        (should (equal '(session-gone) seen))))))
 
 (provide 'agent-shell-autoreconnect-tests)
 
