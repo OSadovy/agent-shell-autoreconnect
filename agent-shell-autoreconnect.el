@@ -125,7 +125,10 @@ called with no arguments at all, and an empty argument list is nil --
 indistinguishable from having nothing to send.")
 
 (defvar-local agent-shell-autoreconnect--subscription nil
-  "Token for this shell's `init-finished' subscription, while one is live.")
+  "Token for this shell's `init-finished' subscription.
+
+Kept for the buffer's life rather than per reconnect: every connection has
+to be watched, and the event is the only place a shell's first one can be.")
 
 (defvar-local agent-shell-autoreconnect--closing nil
   "Non-nil once this shell is being torn down.
@@ -141,6 +144,12 @@ No process reads the same whether one is yet to start or has been and
 gone, and `agent-shell-autoreconnect-connected-p' must answer those
 oppositely.  Tracked on the process, not the client: `acp-make-client'
 leaves `:process' nil until the first request.")
+
+(defvar-local agent-shell-autoreconnect--watched-client nil
+  "The ACP client this shell's notification handler is attached to.")
+
+(defvar-local agent-shell-autoreconnect--watched-process nil
+  "The ACP process this shell's sentinel is attached to.")
 
 (defvar-local agent-shell-autoreconnect--cleanup-subscription nil
   "Token for this shell's `clean-up' subscription.")
@@ -275,16 +284,21 @@ the shell waits forever for an `init-finished' that is not coming."
 (defun agent-shell-autoreconnect--watch-client ()
   "Watch this shell's ACP client, for both the ids and the moment it dies.
 
-Called again after every reconnect, not just when the mode is enabled: a
+Called on every `init-finished' as well as when the mode is enabled: a
 reconnect hands the shell a *new* client, and both of these belong to the
 client they were attached to.  Attaching once would leave the ids frozen at
 whatever the dead client last saw, so a second disconnect would have no
-cursor to resume from and could only report a gap."
+cursor to resume from and could only report a gap.
+
+Attaching is per client and per process rather than per call, since the
+event can arrive more than once for one connection."
   (when-let* ((client (map-elt (agent-shell--state) :client)))
-    (acp-subscribe-to-notifications
-     :client client
-     :buffer (current-buffer)
-     :on-notification #'agent-shell-autoreconnect--note-message-id)
+    (unless (eq client agent-shell-autoreconnect--watched-client)
+      (setq agent-shell-autoreconnect--watched-client client)
+      (acp-subscribe-to-notifications
+       :client client
+       :buffer (current-buffer)
+       :on-notification #'agent-shell-autoreconnect--note-message-id))
     (agent-shell-autoreconnect--watch-process (map-elt client :process))))
 
 (defun agent-shell-autoreconnect--watch-process (process)
@@ -304,7 +318,9 @@ whole reason reconnection waits for a prompt or for
 A host that vanishes without closing the connection -- a closed lid, a
 tunnel -- is noticed when ssh's keepalives give up rather than at once.
 Later than the truth, but still by itself."
-  (when (processp process)
+  (when (and (processp process)
+             (not (eq process agent-shell-autoreconnect--watched-process)))
+    (setq agent-shell-autoreconnect--watched-process process)
     (setq agent-shell-autoreconnect--had-process t)
     (let ((buffer (current-buffer)))
       (add-function
@@ -463,30 +479,29 @@ the replay and rejoined to the copy already on screen."
    (substitute-command-keys "\\[agent-shell-reload] replays the session")))
 
 (defun agent-shell-autoreconnect--on-initialized (_event)
-  "Finish a reconnect: report it, catch up, then send whatever was held back."
-  (agent-shell-autoreconnect--unsubscribe)
-  (agent-shell-autoreconnect--report 'connected)
-  ;; Before the catch-up, so the replay it is about to ask for advances the
-  ;; cursor too and the disconnect after this one has somewhere to resume from.
-  (agent-shell-autoreconnect--watch-client)
-  (agent-shell-autoreconnect--catch-up)
-  (when-let* ((held agent-shell-autoreconnect--deferred))
-    (setq agent-shell-autoreconnect--deferred nil)
-    ;; Out of the event handler before submitting: this runs inside
-    ;; `agent-shell--handle', which submitting would re-enter.
-    (run-at-time 0 nil
-                 (lambda (buffer args)
-                   (when (buffer-live-p buffer)
-                     (with-current-buffer buffer
-                       (apply #'shell-maker-submit args))))
-                 (current-buffer) (car held))))
+  "Watch the connection that just came up, finishing a reconnect into it.
 
-(defun agent-shell-autoreconnect--unsubscribe ()
-  "Drop this shell's `init-finished' subscription, when it has one."
-  (when agent-shell-autoreconnect--subscription
-    (ignore-errors
-      (agent-shell-unsubscribe :subscription agent-shell-autoreconnect--subscription))
-    (setq agent-shell-autoreconnect--subscription nil)))
+Watching happens for every connection, a shell's first included.  The rest
+-- reporting it, catching up, sending what was held back -- is a reconnect
+finishing, and there is nothing to finish when none was under way."
+  (let ((reconnecting (eq agent-shell-autoreconnect--state 'reconnecting)))
+    (when reconnecting
+      (agent-shell-autoreconnect--report 'connected))
+    ;; Before the catch-up, so the replay it is about to ask for advances the
+    ;; cursor too and the disconnect after this one has somewhere to resume from.
+    (agent-shell-autoreconnect--watch-client)
+    (when reconnecting
+      (agent-shell-autoreconnect--catch-up)
+      (when-let* ((held agent-shell-autoreconnect--deferred))
+        (setq agent-shell-autoreconnect--deferred nil)
+        ;; Out of the event handler before submitting: this runs inside
+        ;; `agent-shell--handle', which submitting would re-enter.
+        (run-at-time 0 nil
+                     (lambda (buffer args)
+                       (when (buffer-live-p buffer)
+                         (with-current-buffer buffer
+                           (apply #'shell-maker-submit args))))
+                     (current-buffer) (car held))))))
 
 (defun agent-shell-autoreconnect--reconnect-in-place ()
   "Reconnect the agent, keeping this buffer and its content.
@@ -543,15 +558,14 @@ reconnect refused before it started still has one, and its
 (defun agent-shell-autoreconnect--fail-reconnect (&optional message)
   "Give up on the reconnect in progress, reporting what MESSAGE says of it.
 
-Restores what the attempt tore down and stops waiting on it; anything left
-behind makes one failed reconnect permanent.  The held submission is
+Restores what the attempt tore down and drops what it was holding; anything
+left behind makes one failed reconnect permanent.  The held submission is
 dropped -- `agent-shell-autoreconnect--submit' never passed it on, so the
 text is still in the input area.
 
 Rolled back before MESSAGE is judged: recognising a forgotten session
 needs the session id the roll-back restores."
   (agent-shell-autoreconnect--roll-back)
-  (agent-shell-autoreconnect--unsubscribe)
   (setq agent-shell-autoreconnect--deferred nil)
   (agent-shell-autoreconnect--report
    (if (agent-shell-autoreconnect--session-gone-p message)
@@ -563,14 +577,8 @@ needs the session id the roll-back restores."
 
 DEFERRED is a held submission in the form `agent-shell-autoreconnect--deferred'
 describes, or nil to reconnect without sending anything."
-  (agent-shell-autoreconnect--unsubscribe)
   (setq agent-shell-autoreconnect--deferred deferred)
   (agent-shell-autoreconnect--report 'reconnecting)
-  (setq agent-shell-autoreconnect--subscription
-        (agent-shell-subscribe-to
-         :shell-buffer (current-buffer)
-         :event 'init-finished
-         :on-event #'agent-shell-autoreconnect--on-initialized))
   (condition-case error
       (agent-shell-autoreconnect--reconnect-in-place)
     ;; `quit' as well as `error': C-g through a slow TRAMP connect is
@@ -635,10 +643,10 @@ and \\[keyboard-quit] works, never while you are reading something else."
 ;;; Mode
 
 (defun agent-shell-autoreconnect--teardown ()
-  "Release this shell's subscription and any held submission."
-  (agent-shell-autoreconnect--unsubscribe)
+  "Release this shell's subscriptions and any held submission."
   (setq agent-shell-autoreconnect--closing t)
-  (dolist (slot '(agent-shell-autoreconnect--error-subscription
+  (dolist (slot '(agent-shell-autoreconnect--subscription
+                  agent-shell-autoreconnect--error-subscription
                   agent-shell-autoreconnect--cleanup-subscription))
     (when (symbol-value slot)
       (ignore-errors
@@ -676,6 +684,11 @@ contacting anything."
     ;; keeps handlers in a list, so this runs alongside agent-shell's rather
     ;; than displacing it.
     (agent-shell-autoreconnect--watch-client)
+    (setq agent-shell-autoreconnect--subscription
+          (agent-shell-subscribe-to
+           :shell-buffer (current-buffer)
+           :event 'init-finished
+           :on-event #'agent-shell-autoreconnect--on-initialized))
     ;; A failed request is the only place a forgotten session shows up; no
     ;; process dies and no notification says so.
     (setq agent-shell-autoreconnect--error-subscription

@@ -82,6 +82,7 @@ held submission cannot be recognised by its argument list being non-nil."
     (let ((submitted 0))
       (cl-letf (((symbol-function 'shell-maker-submit)
                  (lambda (&rest _args) (setq submitted (1+ submitted)))))
+        (setq agent-shell-autoreconnect--state 'reconnecting)
         (setq agent-shell-autoreconnect--deferred (list nil))
         (agent-shell-autoreconnect--on-initialized nil)
         ;; Sending is deferred out of the event handler by a timer.
@@ -165,13 +166,28 @@ arrived nowhere else.  Counting cannot be fooled that way."
   "Test a connection that drops is noticed when it drops.
 
 Without this the answer only arrives at the next prompt, which for someone
-reading the buffer is indistinguishable from an agent still thinking."
-  (let ((process (start-process "agent-shell-autoreconnect-test" nil "sleep" "60")))
+reading the buffer is indistinguishable from an agent still thinking.
+
+Watched from `init-finished' rather than from enabling the mode: acp has no
+process until the first request, so a shell enabling the mode has nothing
+to attach a sentinel to yet."
+  (let ((process (start-process "agent-shell-autoreconnect-test" nil "sleep" "60"))
+        (subscriptions nil))
     (unwind-protect
         (with-temp-buffer
-          (agent-shell-autoreconnect-tests--shell (list (cons :process process)))
-          (setq agent-shell-autoreconnect--state 'connected)
-          (agent-shell-autoreconnect--watch-process process)
+          (setq major-mode 'agent-shell-mode)
+          (setq-local agent-shell--state
+                      (list (cons :client (acp-make-client :command "cat"))))
+          (cl-letf (((symbol-function 'agent-shell-subscribe-to)
+                     (lambda (&rest args)
+                       (push (cons (plist-get args :event) (plist-get args :on-event))
+                             subscriptions)
+                       'subscription)))
+            (agent-shell-autoreconnect-mode 1))
+          (should-not agent-shell-autoreconnect--had-process)
+          (map-put! (map-elt (agent-shell--state) :client) :process process)
+          (funcall (alist-get 'init-finished subscriptions) nil)
+          (should agent-shell-autoreconnect--had-process)
           (delete-process process)
           (accept-process-output nil 0.3)
           (should (eq 'disconnected agent-shell-autoreconnect--state)))
@@ -340,8 +356,7 @@ aside, and the handshake in flight."
             (list (list (cons :method "initialize"))))
   (map-put! (map-elt (agent-shell--state) :session) :id nil)
   (setq agent-shell-autoreconnect--state 'reconnecting)
-  (setq agent-shell-autoreconnect--deferred (list nil))
-  (setq agent-shell-autoreconnect--subscription 'token))
+  (setq agent-shell-autoreconnect--deferred (list nil)))
 
 (ert-deftest agent-shell-autoreconnect-fails-a-reconnect-that-dies-handshaking-test ()
   "Test a replacement process that starts and then dies ends the reconnect.
@@ -357,8 +372,7 @@ Missed, the shell waits forever for an `init-finished'."
       (should (eq 'disconnected agent-shell-autoreconnect--state))
       (should (equal "session-1" (map-nested-elt (agent-shell--state) '(:session :id))))
       (should-not (map-elt (agent-shell--state) :active-requests))
-      (should-not agent-shell-autoreconnect--deferred)
-      (should-not agent-shell-autoreconnect--subscription))))
+      (should-not agent-shell-autoreconnect--deferred))))
 
 (ert-deftest agent-shell-autoreconnect-reports-a-session-the-resume-could-not-find-test ()
   "Test a resume refused for a forgotten session says so, not `disconnected'.
