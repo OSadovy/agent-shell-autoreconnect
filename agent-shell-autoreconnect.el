@@ -383,19 +383,29 @@ was genuinely missed.  Taken out here and rejoined to the original by
                (map-elt pending :prompt-turns)))
     text))
 
-(defun agent-shell-autoreconnect--extend-anchor (anchor tail)
+(defun agent-shell-autoreconnect--extend-anchor (anchor rendered tail)
   "Append to ANCHOR's fragment whatever of TAIL is not already rendered.
 
 TAIL is every chunk of the anchor message after its first, so what is
 already on screen is however much of it arrived before the connection
 went -- known exactly, because the chunks were counted as they passed.
 
+RENDERED is how much, taken when the catch-up was asked for.  It is
+passed in rather than read back off ANCHOR because the replay carrying
+TAIL arrives as notifications, and `agent-shell-autoreconnect--note-message-id'
+appends those to ANCHOR's own `:text' -- destructively, since `plist-put'
+on a key that exists returns the list it was given, so the caller's
+ANCHOR is the same object.  Read here, `:text' would already hold the
+very tail being measured against: the offset would land past its end, be
+clamped to the whole of it, and the rejoin would append nothing at all
+while reporting that it had caught up.
+
 The offset is clamped rather than trusted.  A shell that connected in the
 middle of a message never saw that message's real first chunk, so its
 idea of the offset can fall outside TAIL; erring low repeats a little
 text, erring high would drop output that arrived nowhere else."
   (let* ((offset (max 0 (min (length tail)
-                             (- (length (plist-get anchor :text))
+                             (- rendered
                                 (plist-get anchor :first-length))))))
     (when (< offset (length tail))
       (agent-shell--update-fragment
@@ -403,7 +413,29 @@ text, erring high would drop output that arrived nowhere else."
        :namespace-id (plist-get anchor :namespace)
        :block-id (format "%s-agent_message_chunk" (plist-get anchor :id))
        :body (substring tail offset)
-       :append t))))
+       :append t))
+    (agent-shell-autoreconnect--settle-anchor anchor rendered tail offset)))
+
+(defun agent-shell-autoreconnect--settle-anchor (anchor rendered tail offset)
+  "Leave ANCHOR holding the whole message, now TAIL has been rejoined to it.
+
+The replay appended the whole of TAIL to a `:text' that stopped where the
+connection did, so everything between the first chunk and the drop is in
+it twice and its length no longer says how much has been rendered.  Left
+that way, a second drop inside this same message would measure against
+the inflated length and rejoin nothing -- the failure this catch-up just
+worked around, made permanent.  RENDERED and OFFSET are what the rejoin
+already worked out, so the true text is those two pieces concatenated.
+
+Only when ANCHOR is still the newest message.  A replay carrying later
+messages has already moved the cursor past this one, and that is where a
+further catch-up has to resume from."
+  (when (equal (plist-get anchor :id)
+               (plist-get agent-shell-autoreconnect--anchor :id))
+    (setq agent-shell-autoreconnect--anchor
+          (plist-put agent-shell-autoreconnect--anchor :text
+                     (concat (substring (plist-get anchor :text) 0 rendered)
+                             (substring tail offset))))))
 
 (defun agent-shell-autoreconnect--catch-up ()
   "Ask for what was said while disconnected, and render it here.
@@ -423,6 +455,11 @@ cursor was not found."
       (agent-shell-autoreconnect--report-gap)
     (let ((buffer (current-buffer))
           (anchor agent-shell-autoreconnect--anchor)
+          ;; Taken now, while `:text' still means what it says.  The replay
+          ;; about to arrive extends it, and by the time the response lands
+          ;; it no longer records how much of the message reached the
+          ;; buffer -- see `agent-shell-autoreconnect--extend-anchor'.
+          (rendered (length (plist-get agent-shell-autoreconnect--anchor :text)))
           (state (agent-shell--state)))
       ;; Suppresses rendering and accumulates instead, which is what makes
       ;; the decision below possible at all.
@@ -436,15 +473,16 @@ cursor was not found."
                                   (cons 'historyPolicy "after_message")
                                   (cons 'afterMessageId (plist-get anchor :id)))))
        :on-success (lambda (response)
-                     (agent-shell-autoreconnect--apply-catch-up buffer anchor response))
+                     (agent-shell-autoreconnect--apply-catch-up buffer anchor rendered response))
        :on-failure (lambda (_error)
                      (agent-shell-autoreconnect--abandon-catch-up buffer))))))
 
-(defun agent-shell-autoreconnect--apply-catch-up (buffer anchor response)
+(defun agent-shell-autoreconnect--apply-catch-up (buffer anchor rendered response)
   "Render what BUFFER missed when RESPONSE honoured the cursor.
 
 ANCHOR is the message the cursor named, whose remainder is lifted out of
-the replay and rejoined to the copy already on screen."
+the replay and rejoined to the copy already on screen.  RENDERED is how
+much of it that copy was, measured before the replay arrived."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
       (if (not (equal "after_message" (map-elt response 'historyPolicy)))
@@ -455,7 +493,7 @@ the replay and rejoined to the copy already on screen."
         ;; Before rendering the rest: this continues a fragment sitting
         ;; above everything about to be inserted.
         (agent-shell-autoreconnect--extend-anchor
-         anchor
+         anchor rendered
          (agent-shell-autoreconnect--take-anchor-chunks
           (agent-shell--state) (plist-get anchor :id)))
         ;; `full' because the accumulated notifications are already only

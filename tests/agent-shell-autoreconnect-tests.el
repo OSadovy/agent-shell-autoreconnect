@@ -28,6 +28,13 @@
   (setq-local agent-shell--state (list (cons :client client)))
   (setq-local agent-shell-autoreconnect-mode t))
 
+(defun agent-shell-autoreconnect-tests--chunk (id text)
+  "Return an `agent_message_chunk' notification carrying TEXT for message ID."
+  `((method . "session/update")
+    (params (update (sessionUpdate . "agent_message_chunk")
+                    (messageId . ,id)
+                    (content (text . ,text))))))
+
 (ert-deftest agent-shell-autoreconnect-connected-p-test ()
   "Test liveness is read from the ACP client's process, and from its absence.
 
@@ -117,38 +124,61 @@ already on screen and has to be skipped.  Finding where by matching the
 longest overlap between the two strings looks equivalent and is not: five
 rendered \"a\"s against a replayed run of \"a\"s overlap as far as the
 shorter one goes, so the join would skip too much and drop output that
-arrived nowhere else.  Counting cannot be fooled that way."
+arrived nowhere else.  Counting cannot be fooled that way.
+
+Driven the way the reconnect drives it, rather than from an anchor built
+here, because what is counted has to be taken before the replay arrives.
+The replay reaches the anchor too -- `agent-shell-autoreconnect--watch-client'
+subscribes for the very purpose of letting it advance the cursor -- and
+`plist-put' extends the caller's own plist, so an offset read off `:text'
+at rejoin time measures the tail against a `:text' that already contains
+it, clamps to the whole of it and appends nothing.  Hand-built anchors
+cannot see that: the mutation is the bug."
   (with-temp-buffer
     (agent-shell-autoreconnect-tests--shell (list (cons :process nil)))
     (let (appended)
       (cl-letf (((symbol-function 'agent-shell--update-fragment)
                  (lambda (&rest args) (push (plist-get args :body) appended))))
-        ;; "a" arrived as the first chunk and four more "a"s after it, so
-        ;; two of the replayed six are genuinely new.
-        (agent-shell-autoreconnect--extend-anchor
-         (list :id "m" :namespace 1 :text "aaaaa" :first-length 1)
-         "aaaaaa")
-        (should (equal '("aa") appended))
+        ;; "a" arrived as the first chunk and four more "a"s after it.
+        (agent-shell-autoreconnect--note-message-id
+         (agent-shell-autoreconnect-tests--chunk "m" "a"))
+        (agent-shell-autoreconnect--note-message-id
+         (agent-shell-autoreconnect-tests--chunk "m" "aaaa"))
+        (let ((anchor agent-shell-autoreconnect--anchor)
+              ;; Where `agent-shell-autoreconnect--catch-up' takes it.
+              (rendered (length (plist-get agent-shell-autoreconnect--anchor :text))))
+          ;; The replay: every chunk after the first, seen by the same
+          ;; handler on its way past.
+          (agent-shell-autoreconnect--note-message-id
+           (agent-shell-autoreconnect-tests--chunk "m" "aaaa"))
+          (agent-shell-autoreconnect--note-message-id
+           (agent-shell-autoreconnect-tests--chunk "m" "aa"))
+          ;; Two of the replayed six are genuinely new.
+          (agent-shell-autoreconnect--extend-anchor anchor rendered "aaaaaa")
+          (should (equal '("aa") appended))
+          ;; And the anchor is left holding the message as it really is,
+          ;; not the rendered prefix with the replay stacked onto it: the
+          ;; next drop inside this message measures against this.
+          (should (equal "aaaaaaa"
+                         (plist-get agent-shell-autoreconnect--anchor :text))))
         ;; Nothing new: the whole message had arrived before the drop.
         (setq appended nil)
+        (setq agent-shell-autoreconnect--anchor
+              (list :id "m" :namespace 1 :text "hello world" :first-length 5))
         (agent-shell-autoreconnect--extend-anchor
-         (list :id "m" :namespace 1 :text "hello world" :first-length 5)
-         " world")
+         agent-shell-autoreconnect--anchor 11 " world")
         (should-not appended)
         ;; Connected mid-message, so the recorded "first" chunk was not the
         ;; daemon's and the offset overshoots.  Clamped, and nothing is lost.
+        (setq agent-shell-autoreconnect--anchor
+              (list :id "m" :namespace 1 :text "tail-end-only" :first-length 0))
         (agent-shell-autoreconnect--extend-anchor
-         (list :id "m" :namespace 1 :text "tail-end-only" :first-length 0)
-         "short")
+         agent-shell-autoreconnect--anchor 13 "short")
         (should-not appended)))))
 
 (ert-deftest agent-shell-autoreconnect-takes-only-the-anchor-chunks-test ()
   "Test lifting the anchor's chunks leaves every other notification to render."
-  (let* ((chunk (lambda (id text)
-                  `((method . "session/update")
-                    (params (update (sessionUpdate . "agent_message_chunk")
-                                    (messageId . ,id)
-                                    (content (text . ,text)))))))
+  (let* ((chunk #'agent-shell-autoreconnect-tests--chunk)
          (prompt '((method . "session/update")
                    (params (update (sessionUpdate . "user_message_chunk")))))
          (state (list (cons :pending-restore
