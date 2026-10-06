@@ -250,6 +250,75 @@ working or disconnected."
                       ('disconnected "Agent gone.  Submit a prompt to reconnect"))))
     state))
 
+;;; The prompt process
+
+(defvar shell-maker--config)
+(declare-function shell-maker-prompt "shell-maker" (config))
+(declare-function shell-maker-prompt-regexp "shell-maker" (config))
+(declare-function shell-maker-process-name "shell-maker" (config))
+(declare-function shell-maker--output-filter "shell-maker" (process string))
+
+;; A shell has a second process besides the agent: a do-nothing `cat' that
+;; shell-maker starts so comint has something to hang its process mark on --
+;; the boundary between the shell's output and what you are typing.  It is
+;; not a connection and reconnecting the agent does not touch it, but it can
+;; die all the same; Android's phantom process killer reaps an app's children
+;; without asking.  Without it nothing can find the input: submitting, erasing
+;; it with C-c C-u, writing a reply all fail on `processp', and the shell
+;; looks connected while being unusable.
+
+(defun agent-shell-autoreconnect--prompt-end ()
+  "Return the end of this shell's last prompt, or `point-max' if it has none."
+  (save-excursion
+    (goto-char (point-max))
+    (if (re-search-backward (shell-maker-prompt-regexp shell-maker--config)
+                            nil t)
+        (match-end 0)
+      (point-max))))
+
+(defun agent-shell-autoreconnect--restore-prompt-process ()
+  "Start this shell's prompt process again when it has died.
+
+Return the new process, or nil when the old one is still there or this is
+not a shell-maker buffer.  Started the way shell-maker starts it, so
+nothing downstream can tell the two apart.
+
+When the process died, the default sentinel wrote a line saying so at the
+process mark -- between the last prompt and anything typed after it.  The
+input cannot simply resume past that line: it would be typed on a line
+with no prompt, which reads as output and which prompt navigation skips.
+So a fresh prompt is written below the notice, as shell-maker does when a
+shell starts, and what had been typed is carried onto it.  The notice
+stays, as the record of what happened."
+  (when (and (bound-and-true-p shell-maker--config)
+             (not (get-buffer-process (current-buffer))))
+    (let* ((prompt-end (agent-shell-autoreconnect--prompt-end))
+           (notice-end (save-excursion
+                         (goto-char prompt-end)
+                         (and (looking-at "\nProcess [^\n]*\n")
+                              (match-end 0))))
+           (name (shell-maker-process-name shell-maker--config))
+           (process (condition-case nil
+                        (start-process name (current-buffer) "hexl")
+                      (file-error (start-process name (current-buffer) "cat")))))
+      (set-process-query-on-exit-flag process nil)
+      (set-process-filter process #'shell-maker--output-filter)
+      (if (not notice-end)
+          (set-marker (process-mark process) prompt-end)
+        ;; Blank lines before the text are what RET left while the shell
+        ;; could not take input, not anything meant to be sent.
+        (let ((typed (string-trim-left
+                      (buffer-substring-no-properties notice-end (point-max))
+                      "\n+")))
+          (let ((inhibit-read-only t))
+            (delete-region notice-end (point-max)))
+          (set-marker (process-mark process) (point-max))
+          (shell-maker--output-filter
+           process (concat "\n" (shell-maker-prompt shell-maker--config)))
+          (goto-char (point-max))
+          (insert typed)))
+      process)))
+
 ;;; Reconnecting
 
 (defun agent-shell-autoreconnect--session-gone-p (message)
@@ -643,21 +712,32 @@ and \\[keyboard-quit] works, never while you are reading something else."
     (user-error "Reconnection is not enabled in this buffer"))
   (when (eq agent-shell-autoreconnect--state 'reconnecting)
     (user-error "Reconnecting, please wait"))
-  (when (eq agent-shell-autoreconnect--state 'session-gone)
-    ;; Said before the liveness check, which would otherwise answer
-    ;; "already connected" -- true of the process, and the wrong answer to
-    ;; the question being asked.
-    (user-error "Session no longer exists on the agent; this shell cannot be resumed"))
-  (when (agent-shell-autoreconnect-connected-p)
-    ;; Reported rather than only refused: being told it is already connected
-    ;; is the answer the question was asking for.
-    (agent-shell-autoreconnect--report 'connected)
-    (user-error "Already connected"))
-  (message "Reconnecting...")
-  (agent-shell-autoreconnect--reconnect))
+  ;; First, since a dead prompt process is the other way a shell stops
+  ;; working, and this is the command reached for when one has.
+  (let ((restored (agent-shell-autoreconnect--restore-prompt-process)))
+    (when (eq agent-shell-autoreconnect--state 'session-gone)
+      ;; Said before the liveness check, which would otherwise answer
+      ;; "already connected" -- true of the process, and the wrong answer to
+      ;; the question being asked.
+      (user-error "Session no longer exists on the agent; this shell cannot be resumed"))
+    (cond
+     ((agent-shell-autoreconnect-connected-p)
+      ;; Reported rather than only refused: being told it is already
+      ;; connected is the answer the question was asking for.
+      (agent-shell-autoreconnect--report 'connected)
+      (if restored
+          (message "Prompt restored; agent already connected")
+        (user-error "Already connected")))
+     (t
+      (message "Reconnecting...")
+      (agent-shell-autoreconnect--reconnect)))))
 
 (defun agent-shell-autoreconnect--submit (original &rest args)
   "Reconnect before ORIGINAL sends ARGS, when this shell's agent is gone."
+  ;; Whatever happens next reads the input through the process mark, so it
+  ;; has to exist before anything else here can work.
+  (when (bound-and-true-p agent-shell-autoreconnect-mode)
+    (agent-shell-autoreconnect--restore-prompt-process))
   (cond
    ((not (and (bound-and-true-p agent-shell-autoreconnect-mode)
               agent-shell-autoreconnect-on-submit))

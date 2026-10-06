@@ -433,6 +433,97 @@ Only a reconnect in progress turns every error into one."
          '((:data (:message . "Session session-1 not found"))))
         (should (equal '(session-gone) seen))))))
 
+;; Special here as well: the package's `defvar' covers only its own file, and
+;; bound lexically in this one the package would never see the binding.
+(defvar shell-maker--config)
+
+(defmacro agent-shell-autoreconnect-tests--with-shell-maker (&rest body)
+  "Run BODY with the shell-maker calls the prompt process needs supplied.
+
+shell-maker is not loaded here, any more than agent-shell is.  Its output
+filter is reduced to what matters here: writing at the end, and moving
+the process mark past what it wrote."
+  (declare (indent 0))
+  `(cl-letf (((symbol-function 'shell-maker-prompt)
+              (lambda (_config) "Claude> "))
+             ((symbol-function 'shell-maker-prompt-regexp)
+              (lambda (_config) "^Claude> "))
+             ((symbol-function 'shell-maker-process-name)
+              (lambda (_config) "agent-shell-autoreconnect-test"))
+             ((symbol-function 'shell-maker--output-filter)
+              (lambda (process string)
+                (with-current-buffer (process-buffer process)
+                  (goto-char (point-max))
+                  (insert string)
+                  (set-marker (process-mark process) (point))))))
+     (let ((shell-maker--config 'config))
+       ,@body)))
+
+(defun agent-shell-autoreconnect-tests--input ()
+  "Return the input of the current shell: everything after its process mark."
+  (buffer-substring (process-mark (get-buffer-process (current-buffer)))
+                    (point-max)))
+
+(ert-deftest agent-shell-autoreconnect-restores-onto-a-fresh-prompt-test ()
+  "Test a dead prompt process comes back with a prompt to type at.
+
+The notice of its death sits between the old prompt and the input, so
+resuming there would leave the input on a line with no prompt.  What was
+typed moves to the new one, without the blank lines RET left meanwhile."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--with-shell-maker
+      (insert "Claude> earlier\nreply\n\nClaude> \nProcess agent killed\n\n\ntyped")
+      (let ((process (agent-shell-autoreconnect--restore-prompt-process)))
+        (unwind-protect
+            (progn
+              (should (process-live-p process))
+              (should (eq process (get-buffer-process (current-buffer))))
+              (should (string-suffix-p
+                       "Claude> \nProcess agent killed\n\nClaude> typed"
+                       (buffer-string)))
+              (should (equal "typed" (agent-shell-autoreconnect-tests--input)))
+              ;; Left alone while alive: two would leave `get-buffer-process'
+              ;; free to answer with either.
+              (should-not (agent-shell-autoreconnect--restore-prompt-process)))
+          (delete-process process))))))
+
+(ert-deftest agent-shell-autoreconnect-restores-in-place-without-a-notice-test ()
+  "Test a prompt with no death notice under it is reused, not repeated.
+
+Nothing then separates the prompt from the input, and a second prompt
+would only be noise."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--with-shell-maker
+      (insert "Claude> typed")
+      (let ((process (agent-shell-autoreconnect--restore-prompt-process)))
+        (unwind-protect
+            (progn
+              (should (equal "Claude> typed" (buffer-string)))
+              (should (equal "typed" (agent-shell-autoreconnect-tests--input))))
+          (delete-process process))))))
+
+(ert-deftest agent-shell-autoreconnect-reconnect-restores-a-connected-shell-test ()
+  "Test the reconnect command repairs the prompt of a connected shell.
+
+That shell is connected, and refusing with \"Already connected\" -- true,
+and what the command used to say -- left it unable to take input."
+  (with-temp-buffer
+    (agent-shell-autoreconnect-tests--with-shell-maker
+      (agent-shell-autoreconnect-tests--shell (list (cons :process nil)))
+      (insert "Claude> ")
+      (let ((reconnected nil))
+        (cl-letf (((symbol-function 'agent-shell-autoreconnect--reconnect)
+                   (lambda (&rest _) (setq reconnected t))))
+          (unwind-protect
+              (progn
+                (agent-shell-autoreconnect-reconnect)
+                (should (get-buffer-process (current-buffer)))
+                (should-not reconnected)
+                (should-error (agent-shell-autoreconnect-reconnect)
+                              :type 'user-error))
+            (when (get-buffer-process (current-buffer))
+              (delete-process (get-buffer-process (current-buffer))))))))))
+
 (provide 'agent-shell-autoreconnect-tests)
 
 ;;; agent-shell-autoreconnect-tests.el ends here
